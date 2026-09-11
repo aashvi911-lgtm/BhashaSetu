@@ -12,7 +12,7 @@ android {
     defaultConfig {
         applicationId = "com.example.translation"
 
-        minSdk = 24
+        minSdk = 28
         targetSdk = 36
 
         versionCode = 1
@@ -65,6 +65,7 @@ chaquopy {
         pip {
             install("numpy")
             install("sentencepiece")
+            install("reportlab")
         }
     }
 }

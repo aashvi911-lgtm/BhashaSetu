@@ -6,7 +6,14 @@ import numpy as np
 
 import sentencepiece as spm
 from java import jclass
-
+from santali_dictionary_ALL import (
+    lookup_santali as _dictionary_lookup,
+    SANTALI_DICTIONARY as _SANTALI_DICTIONARY,
+)
+print("Local Santali dictionary loaded successfully (ALL supplied workbook sources)")
+print("Runtime dictionary entry count:", len(_SANTALI_DICTIONARY))
+print("Runtime dictionary test [नमस्कार]:", _dictionary_lookup("नमस्कार"))
+print("Runtime dictionary test [नमस्कार।]:", _dictionary_lookup("नमस्कार।"))
 
 # ============================================================
 # ANDROID
@@ -125,8 +132,33 @@ _tgt_token_to_id = _load_json("dict.TGT.json")
 _src_id_to_token = {v: k for k, v in _src_token_to_id.items()}
 _tgt_id_to_token = {v: k for k, v in _tgt_token_to_id.items()}
 
-print("SRC vocab size:", len(_src_token_to_id))
-print("TGT vocab size:", len(_tgt_token_to_id))
+# The ONNX bundles released for IndicTrans2 also contain these metadata files.
+# They let us validate that the vocabularies and generated IDs match the graph
+# instead of silently decoding an ID with the wrong vocabulary.
+_model_config = _load_json("config.json")
+_tokenizer_meta = _load_json("tokenizer_meta.json")
+
+_SRC_VOCAB_SIZE = int(_tokenizer_meta.get("src_dict_size", len(_src_token_to_id)))
+_TGT_VOCAB_SIZE = int(_tokenizer_meta.get("tgt_dict_size", len(_tgt_token_to_id)))
+_META_UNK_ID = int(_tokenizer_meta.get("unk_id", 3))
+
+print("SRC vocab size:", len(_src_token_to_id), "metadata:", _SRC_VOCAB_SIZE)
+print("TGT vocab size:", len(_tgt_token_to_id), "metadata:", _TGT_VOCAB_SIZE)
+print("Model name:", _model_config.get("_name_or_path", "unknown"))
+print("Model type:", _model_config.get("model_type", "unknown"))
+
+if len(_src_token_to_id) != _SRC_VOCAB_SIZE:
+    print("WARNING: SRC dictionary size does not match tokenizer_meta.json")
+
+if len(_tgt_token_to_id) != _TGT_VOCAB_SIZE:
+    print("WARNING: TGT dictionary size does not match tokenizer_meta.json")
+
+# Hindi -> Santali requires the Indic-to-Indic checkpoint.  Do not hard-fail
+# on custom model names, but make an accidental en-indic checkpoint obvious.
+_model_name_lower = str(_model_config.get("_name_or_path", "")).lower()
+if _model_name_lower and "indic-indic" not in _model_name_lower:
+    print("WARNING: config does not identify this checkpoint as an indic-indic model.")
+    print("         Hindi -> Santali requires the Indic-to-Indic checkpoint.")
 
 
 # ============================================================
@@ -144,10 +176,19 @@ _PAD_ID = _src_token_to_id[_PAD_TOKEN]
 _EOS_ID = _src_token_to_id[_EOS_TOKEN]
 _UNK_ID = _src_token_to_id[_UNK_TOKEN]
 
+# Keep target-side special IDs separate.  They are normally 0/1/2/3 for
+# IndicTrans2, but decoding should never assume that across arbitrary bundles.
+_TGT_BOS_ID = _tgt_token_to_id[_BOS_TOKEN]
 _TGT_PAD_ID = _tgt_token_to_id[_PAD_TOKEN]
 _TGT_EOS_ID = _tgt_token_to_id[_EOS_TOKEN]
+_TGT_UNK_ID = _tgt_token_to_id[_UNK_TOKEN]
 
-print("BOS:", _BOS_ID, "PAD:", _PAD_ID, "EOS:", _EOS_ID, "UNK:", _UNK_ID)
+print("SRC special IDs:", _BOS_ID, _PAD_ID, _EOS_ID, _UNK_ID)
+print("TGT special IDs:", _TGT_BOS_ID, _TGT_PAD_ID, _TGT_EOS_ID, _TGT_UNK_ID)
+
+if _META_UNK_ID != _TGT_UNK_ID:
+    print("WARNING: tokenizer_meta unk_id differs from target <unk> ID:",
+          _META_UNK_ID, _TGT_UNK_ID)
 
 
 # ============================================================
@@ -200,17 +241,24 @@ print("SentencePiece models loaded, piece count:", _src_sp.get_piece_size())
 
 _generation_config = _load_json("generation_config.json")
 
-# VERIFY: fairseq-derived seq2seq models (this lineage) conventionally
-# start decoding from the eos id, not from <s>. We prefer whatever
-# generation_config.json says; fall back to EOS (fairseq convention)
-# rather than BOS if the key is missing.
+# IndicTrans2 generation_config.json uses decoder_start_token_id=2,
+# which is the EOS token for this model family. Read it from the bundle
+# instead of hard-coding it.
 
-_DECODER_START_ID = _generation_config.get(
+_DECODER_START_ID = int(_generation_config.get(
     "decoder_start_token_id",
     _TGT_EOS_ID
-)
+))
 
 print("DECODER_START_ID:", _DECODER_START_ID)
+print("EOS_ID:", int(_generation_config.get("eos_token_id", _TGT_EOS_ID)))
+print("PAD_ID:", int(_generation_config.get("pad_token_id", _TGT_PAD_ID)))
+
+if not (0 <= _DECODER_START_ID < _TGT_VOCAB_SIZE):
+    raise RuntimeError(
+        "decoder_start_token_id is outside the target vocabulary: "
+        + str(_DECODER_START_ID)
+    )
 
 
 # ============================================================
@@ -323,15 +371,10 @@ def _indic_trivial_tokenize(text):
 
 
 def _preprocess_hindi(hindi_text):
-    """
-    Prepare Hindi in the same general order as IndicTrans2:
-      normalization -> Indic punctuation tokenization.
-    """
+    """Android-safe lightweight IndicTrans2 text preprocessing."""
     normalized = _normalize_hindi_text(hindi_text)
     tokenized = _indic_trivial_tokenize(normalized)
-
     print("Preprocessed Hindi:", tokenized)
-
     return tokenized
 
 
@@ -357,34 +400,50 @@ def _split_tags(tokens):
 
 def _encode_src(tagged_text):
     """
-    tagged_text: "hin_Deva sat_Olck <the actual sentence>"
-    Returns: list of vocab ids (tags looked up directly, rest via SentencePiece)
+    Convert an IndicTrans2 tagged sentence to source vocabulary IDs.
+
+    This mirrors AI4Bharat's IndicTransTokenizer:
+        [src_lang, tgt_lang] + SentencePiece(source_text) + EOS
+
+    IMPORTANT: the language tags stay BEFORE the SentencePiece pieces.
     """
 
-    tokens = tagged_text.split(" ")
+    parts = tagged_text.split(" ", 2)
 
-    tags, non_tags = _split_tags(tokens)
+    if len(parts) != 3:
+        raise ValueError(
+            "Expected '<src_lang> <tgt_lang> <sentence>', got: "
+            + repr(tagged_text)
+        )
 
-    rest_text = " ".join(non_tags)
+    src_lang, tgt_lang, sentence = parts
 
-    # IndicTrans2 preprocesses the Hindi sentence before SPM.
-    # Language tags are already removed above, so only the actual
-    # Hindi sentence is normalized/tokenized here.
-    rest_text = _preprocess_hindi(rest_text)
+    if src_lang not in SPECIAL_TAGS:
+        raise ValueError("Unknown source language tag: " + src_lang)
 
-    pieces = _src_sp.encode(rest_text, out_type=str)
+    if tgt_lang not in SPECIAL_TAGS:
+        raise ValueError("Unknown target language tag: " + tgt_lang)
 
-    all_tokens = tags + pieces
+    # The official tokenizer receives the already-preprocessed sentence and
+    # then applies SentencePiece to only the sentence portion.
+    sentence = _preprocess_hindi(sentence)
+    pieces = _src_sp.encode(sentence, out_type=str)
 
-    ids = [
-        _src_token_to_id.get(tok, _UNK_ID)
-        for tok in all_tokens
-    ]
+    # DO NOT reorder these. AI4Bharat's tokenizer uses this exact order.
+    all_tokens = [src_lang, tgt_lang] + pieces
 
-    # VERIFY: fairseq convention appends </s> at the end of the
-    # encoder input. If translations look truncated/off by one,
-    # try removing this line first.
+    ids = []
+    for token in all_tokens:
+        token_id = int(_src_token_to_id.get(token, _UNK_ID))
+        if token_id < 0 or token_id >= _SRC_VOCAB_SIZE:
+            token_id = _UNK_ID
+        ids.append(token_id)
+
+    # IndicTransTokenizer.build_inputs_with_special_tokens() appends EOS.
     ids.append(_EOS_ID)
+
+    print("Source pieces:", pieces[:40])
+    print("Source IDs:", ids[:60])
 
     return ids
 
@@ -392,31 +451,6 @@ def _encode_src(tagged_text):
 # ============================================================
 # TARGET DETOKENIZE: ids -> text
 # ============================================================
-
-def _decode_tgt(ids):
-
-    pieces = []
-
-    for token_id in ids:
-
-        if token_id in (_TGT_PAD_ID, _TGT_EOS_ID, _BOS_ID):
-            continue
-
-        piece = _tgt_id_to_token.get(token_id)
-
-        if piece is not None and piece not in SPECIAL_TAGS:
-            pieces.append(piece)
-
-    if not pieces:
-        return ""
-
-    # CONFIRMED: target-side detokenization is plain string
-    # concatenation + replacing the SentencePiece "▁" marker with
-    # a space — not a call into sp.decode().
-    text = "".join(pieces).replace("\u2581", " ").strip()
-
-    return text
-
 
 # ============================================================
 # ONNX RUNTIME
@@ -430,9 +464,25 @@ _session_options = jclass(
 
 _encoder_path = os.path.join(_MODEL_DIR, "encoder_model.onnx")
 _decoder_path = os.path.join(_MODEL_DIR, "decoder_model.onnx")
+_decoder_with_past_path = os.path.join(
+    _MODEL_DIR,
+    "decoder_with_past_model.onnx"
+)
 
-_encoder = _env.createSession(_encoder_path, _session_options)
-_decoder = _env.createSession(_decoder_path, _session_options)
+_encoder = _env.createSession(
+    _encoder_path,
+    _session_options
+)
+
+_decoder = _env.createSession(
+    _decoder_path,
+    _session_options
+)
+
+_decoder_with_past = _env.createSession(
+    _decoder_with_past_path,
+    _session_options
+)
 
 print("ONNX models loaded successfully")
 
@@ -534,360 +584,416 @@ def _run_encoder(input_ids, attention_mask):
 # ============================================================
 # DECODER
 # ============================================================
+#
+# IMPORTANT:
+# IndicTrans2 ONNX is exported as two decoder graphs:
+#
+#   decoder_model.onnx
+#       First decoding step. Produces logits + KV cache.
+#
+#   decoder_with_past_model.onnx
+#       Every later decoding step. Takes the KV cache from the
+#       previous step and only receives the newly generated token.
+#
+# The previous implementation repeatedly called decoder_model.onnx
+# with the entire generated prefix. That is NOT the intended ONNX
+# inference path and can produce bad/repetitive decoding.
+#
+# This implementation follows the ONNX inference helper used for
+# this IndicTrans2 ONNX bundle: first decoder -> cached KV ->
+# decoder_with_past for subsequent tokens.
+# ============================================================
 
-def _run_decoder(decoder_input_ids, encoder_hidden_states, encoder_attention_mask):
+_decoder_input_names = [
+    str(x) for x in _decoder.getInputNames().toArray()
+]
+
+_decoder_output_names = [
+    str(x) for x in _decoder.getOutputNames().toArray()
+]
+
+_decoder_past_input_names = [
+    str(x) for x in _decoder_with_past.getInputNames().toArray()
+]
+
+_decoder_past_output_names = [
+    str(x) for x in _decoder_with_past.getOutputNames().toArray()
+]
+
+print("Decoder input names:", _decoder_input_names)
+print("Decoder output names:", _decoder_output_names)
+print("Decoder-with-past input names:", _decoder_past_input_names)
+print("Decoder-with-past output names:", _decoder_past_output_names)
+
+# First decoder output = logits.
+# The remaining outputs are four KV tensors per transformer layer:
+# decoder key, decoder value, encoder key, encoder value.
+if (len(_decoder_output_names) - 1) % 4 != 0:
+    raise RuntimeError(
+        "Unexpected decoder output count: "
+        + str(len(_decoder_output_names))
+        + ". Expected 1 logits output + 4 KV outputs per layer."
+    )
+
+_NUM_DECODER_LAYERS = (len(_decoder_output_names) - 1) // 4
+
+print("Decoder layers:", _NUM_DECODER_LAYERS)
+
+
+def _run_first_decoder(
+    decoder_input_ids,
+    encoder_hidden_states,
+    encoder_attention_mask,
+):
+    """
+    Run decoder_model.onnx for the first generated token.
+
+    Returns:
+        logits, past_outputs
+    """
 
     inputs = HashMap()
 
-    input_names = [
-        str(x) for x in _decoder.getInputNames().toArray()
-    ]
-
-    print("Decoder inputs:", input_names)
-
-    for name in input_names:
+    for name in _decoder_input_names:
 
         if name == "input_ids":
-            inputs.put(name, _tensor(decoder_input_ids))
+            inputs.put(
+                name,
+                _tensor(decoder_input_ids)
+            )
 
         elif name == "decoder_input_ids":
-            inputs.put(name, _tensor(decoder_input_ids))
+            inputs.put(
+                name,
+                _tensor(decoder_input_ids)
+            )
 
         elif name == "encoder_hidden_states":
-            inputs.put(name, _tensor(encoder_hidden_states))
+            inputs.put(
+                name,
+                _tensor(encoder_hidden_states)
+            )
 
         elif name == "encoder_attention_mask":
-            inputs.put(name, _tensor(encoder_attention_mask))
+            inputs.put(
+                name,
+                _tensor(encoder_attention_mask)
+            )
 
         elif name == "attention_mask":
+            # Some exported graphs expose a decoder attention mask.
+            mask = np.ones(
+                decoder_input_ids.shape,
+                dtype=np.int64
+            )
 
-            mask = np.ones(decoder_input_ids.shape, dtype=np.int64)
-            inputs.put(name, _tensor(mask))
+            inputs.put(
+                name,
+                _tensor(mask)
+            )
+
+        else:
+            print(
+                "WARNING: Unhandled first-decoder input:",
+                name
+            )
 
     result = _decoder.run(inputs)
 
     try:
-        logits = _java_to_numpy(result.get(0).getValue())
+        logits = _java_to_numpy(
+            result.get(0).getValue()
+        )
+
+        past_outputs = []
+
+        for i in range(1, len(_decoder_output_names)):
+            past_outputs.append(
+                _java_to_numpy(
+                    result.get(i).getValue()
+                )
+            )
+
     finally:
         result.close()
 
-    return logits
+    return logits, past_outputs
 
 
-# ============================================================
-# BEAM SEARCH DECODER
-# ============================================================
-#
-# IndicTrans2's official CT2 inference uses beam_size=5.
-# The previous Android implementation used greedy argmax decoding,
-# which could fall into long repetition loops.
-#
-# This implementation keeps the same ONNX encoder/decoder but runs
-# all active beams together as one batch. That avoids running the
-# decoder separately for every beam.
-# ============================================================
-
-BEAM_SIZE = 5
-MAX_LENGTH = 64
-LENGTH_PENALTY = 1.0
-
-
-def _log_softmax(x):
-    """
-    Numerically stable log-softmax for a 1-D NumPy array.
-    """
-    x = np.asarray(x, dtype=np.float64)
-
-    max_x = np.max(x)
-    shifted = x - max_x
-
-    log_sum_exp = max_x + np.log(np.sum(np.exp(shifted)))
-
-    return x - log_sum_exp
-
-
-def _repeat_encoder_for_beams(encoder_hidden_states, beam_count):
-    """
-    Repeat encoder hidden states across the beam dimension.
-
-    Input:
-        [1, source_length, hidden_size]
-
-    Output:
-        [beam_count, source_length, hidden_size]
-    """
-    if encoder_hidden_states.ndim != 3:
-        raise RuntimeError(
-            "Unexpected encoder hidden-state shape: "
-            + str(encoder_hidden_states.shape)
-        )
-
-    return np.repeat(
-        encoder_hidden_states,
-        beam_count,
-        axis=0
-    )
-
-
-def _beam_search(
-    encoder_hidden_states,
+def _run_decoder_with_past(
+    decoder_input_ids,
     encoder_attention_mask,
-    beam_size=BEAM_SIZE,
-    max_length=MAX_LENGTH,
-    length_penalty=LENGTH_PENALTY,
+    past_outputs,
 ):
     """
-    Beam-search decoding for the ONNX IndicTrans2 decoder.
+    Run decoder_with_past_model.onnx for subsequent tokens.
 
-    Each beam is represented as:
-        (token_ids, cumulative_log_probability, finished)
+    The ONNX export names the cache inputs:
+        past_key_values.{layer}.decoder.key
+        past_key_values.{layer}.decoder.value
+        past_key_values.{layer}.encoder.key
+        past_key_values.{layer}.encoder.value
 
-    token_ids includes the decoder start token.
+    The first decoder returns these tensors in exactly that same
+    per-layer order.
     """
 
-    # --------------------------------------------------------
-    # Initial beam
-    # --------------------------------------------------------
+    expected_past_count = _NUM_DECODER_LAYERS * 4
 
-    beams = [
-        ([_DECODER_START_ID], 0.0, False)
+    if len(past_outputs) != expected_past_count:
+        raise RuntimeError(
+            "Unexpected KV cache count: "
+            + str(len(past_outputs))
+            + "; expected "
+            + str(expected_past_count)
+        )
+
+    inputs = HashMap()
+
+    for name in _decoder_past_input_names:
+
+        if name == "input_ids":
+            inputs.put(
+                name,
+                _tensor(decoder_input_ids)
+            )
+
+        elif name == "decoder_input_ids":
+            inputs.put(
+                name,
+                _tensor(decoder_input_ids)
+            )
+
+        elif name == "encoder_attention_mask":
+            inputs.put(
+                name,
+                _tensor(encoder_attention_mask)
+            )
+
+        elif name.startswith("past_key_values."):
+
+            # Parse:
+            # past_key_values.<layer>.<side>.<key/value>
+            #
+            # Example:
+            # past_key_values.0.decoder.key
+
+            parts = name.split(".")
+
+            if len(parts) != 4:
+                raise RuntimeError(
+                    "Unexpected past-cache input name: "
+                    + name
+                )
+
+            layer_index = int(parts[1])
+            side = parts[2]
+            kind = parts[3]
+
+            if side == "decoder" and kind == "key":
+                offset = 0
+
+            elif side == "decoder" and kind == "value":
+                offset = 1
+
+            elif side == "encoder" and kind == "key":
+                offset = 2
+
+            elif side == "encoder" and kind == "value":
+                offset = 3
+
+            else:
+                raise RuntimeError(
+                    "Unexpected past-cache input name: "
+                    + name
+                )
+
+            cache_index = layer_index * 4 + offset
+
+            inputs.put(
+                name,
+                _tensor(past_outputs[cache_index])
+            )
+
+        else:
+            print(
+                "WARNING: Unhandled decoder-with-past input:",
+                name
+            )
+
+    result = _decoder_with_past.run(inputs)
+
+    try:
+        logits = _java_to_numpy(
+            result.get(0).getValue()
+        )
+
+        past_outputs_next = []
+
+        for i in range(1, len(_decoder_past_output_names)):
+            past_outputs_next.append(
+                _java_to_numpy(
+                    result.get(i).getValue()
+                )
+            )
+
+    finally:
+        result.close()
+
+    return logits, past_outputs_next
+
+
+# ============================================================
+# GREEDY GENERATION
+# ============================================================
+#
+# Start with decoder_start_token_id.
+# First token -> decoder_model.onnx.
+# Every later token -> decoder_with_past_model.onnx.
+#
+# This is deliberately greedy for the Android prototype.
+# It is much safer than the previous custom beam-search path and
+# matches the reference ONNX helper for this model family.
+# ============================================================
+
+_MODEL_MAX_TARGET = int(
+    _model_config.get(
+        "max_target_positions",
+        256
+    )
+)
+
+MAX_LENGTH = min(
+    128,
+    _MODEL_MAX_TARGET
+)
+
+
+def _generate(
+    encoder_hidden_states,
+    encoder_attention_mask,
+    max_length=MAX_LENGTH,
+):
+    decoder_input_ids = np.array(
+        [[_DECODER_START_ID]],
+        dtype=np.int64
+    )
+
+    output_ids = [
+        _DECODER_START_ID
     ]
 
-    print(
-        "Beam search:",
-        "beam_size =", beam_size,
-        "max_length =", max_length
-    )
+    past_outputs = None
 
     for step in range(max_length):
 
-        active_beams = [
-            beam for beam in beams
-            if not beam[2]
-        ]
+        if step == 0:
 
-        finished_beams = [
-            beam for beam in beams
-            if beam[2]
-        ]
+            logits, past_outputs = _run_first_decoder(
+                decoder_input_ids,
+                encoder_hidden_states,
+                encoder_attention_mask,
+            )
 
-        # Nothing left to expand.
-        if not active_beams:
-            break
-
-        # ----------------------------------------------------
-        # Batch all active beams into one decoder call
-        # ----------------------------------------------------
-
-        decoder_input_ids = np.array(
-            [beam[0] for beam in active_beams],
-            dtype=np.int64
-        )
-
-        beam_count = len(active_beams)
-
-        beam_encoder_hidden = _repeat_encoder_for_beams(
-            encoder_hidden_states,
-            beam_count
-        )
-
-        beam_attention_mask = np.repeat(
-            encoder_attention_mask,
-            beam_count,
-            axis=0
-        )
-
-        logits = _run_decoder(
-            decoder_input_ids,
-            beam_encoder_hidden,
-            beam_attention_mask
-        )
-
-        if logits.ndim == 3:
-            next_logits = logits[:, -1, :]
-        elif logits.ndim == 2:
-            next_logits = logits
         else:
+
+            logits, past_outputs = _run_decoder_with_past(
+                decoder_input_ids,
+                encoder_attention_mask,
+                past_outputs,
+            )
+
+        # Expected:
+        # [batch, sequence, vocabulary]
+        if logits.ndim != 3:
             raise RuntimeError(
-                "Unexpected decoder output shape: "
+                "Unexpected decoder logits shape: "
                 + str(logits.shape)
             )
 
-        # ----------------------------------------------------
-        # Expand every active beam
-        # ----------------------------------------------------
+        next_logits = logits[0, -1, :]
 
-        candidates = list(finished_beams)
-
-        for beam_index, beam in enumerate(active_beams):
-
-            token_ids, score, _ = beam
-
-            log_probs = _log_softmax(
-                next_logits[beam_index]
+        if next_logits.shape[0] != _TGT_VOCAB_SIZE:
+            raise RuntimeError(
+                "Decoder vocabulary mismatch: logits have "
+                + str(next_logits.shape[0])
+                + " classes, but dict.TGT.json has "
+                + str(_TGT_VOCAB_SIZE)
+                + ". Make sure all ONNX/tokenizer files "
+                + "come from the same checkpoint."
             )
 
-            # Only the best beam_size tokens from each beam are
-            # needed to construct the next beam set.
-            top_k = min(
-                beam_size,
-                log_probs.shape[0]
-            )
-
-            top_ids = np.argpartition(
-                -log_probs,
-                top_k - 1
-            )[:top_k]
-
-            top_ids = top_ids[
-                np.argsort(-log_probs[top_ids])
-            ]
-
-            for token_id in top_ids:
-
-                token_id = int(token_id)
-
-                new_score = (
-                    score + float(log_probs[token_id])
-                )
-
-                if token_id == _TGT_EOS_ID:
-                    new_tokens = token_ids.copy()
-                    finished = True
-
-                elif token_id == _TGT_PAD_ID:
-                    new_tokens = token_ids.copy()
-                    finished = True
-
-                else:
-                    new_tokens = token_ids + [token_id]
-                    finished = False
-
-                candidates.append(
-                    (
-                        new_tokens,
-                        new_score,
-                        finished
-                    )
-                )
-
-        # ----------------------------------------------------
-        # Keep the best cumulative-score beams
-        # ----------------------------------------------------
-
-        candidates.sort(
-            key=lambda beam: beam[1],
-            reverse=True
+        next_id = int(
+            np.argmax(next_logits)
         )
 
-        beams = candidates[:beam_size]
-
-        # ----------------------------------------------------
-        # Logging
-        # ----------------------------------------------------
+        output_ids.append(next_id)
 
         print(
-            "Beam step",
+            "Decode step",
             step,
-            "active:",
-            sum(1 for b in beams if not b[2]),
-            "finished:",
-            sum(1 for b in beams if b[2])
+            "-> token",
+            next_id,
+            "piece =",
+            _tgt_id_to_token.get(
+                next_id,
+                _UNK_TOKEN
+            )
         )
 
-        for beam_index, beam in enumerate(beams):
-            print(
-                "  Beam",
-                beam_index,
-                "score:",
-                round(beam[1], 4),
-                "length:",
-                len(beam[0]) - 1,
-                "last:",
-                beam[0][-1]
-            )
-
-        # ----------------------------------------------------
-        # Early stopping
-        # ----------------------------------------------------
-        #
-        # Once every retained beam has reached EOS/PAD, there
-        # is nothing left to decode.
-        # ----------------------------------------------------
-
-        if all(beam[2] for beam in beams):
+        # Stop exactly at EOS.
+        if next_id == _TGT_EOS_ID:
             break
 
-    # --------------------------------------------------------
-    # Select final hypothesis
-    # --------------------------------------------------------
-    #
-    # IMPORTANT:
-    # The previous version normalized the score by raw token
-    # length and could therefore select a very long repetitive
-    # unfinished beam over a much better completed translation.
-    #
-    # For this Android implementation, a completed EOS/PAD beam
-    # is preferred. Among completed beams, use the highest
-    # cumulative log-probability. If none completed, use the
-    # highest-scoring active beam.
-    # --------------------------------------------------------
+        # PAD should never normally be generated, but stopping here
+        # prevents an accidental padding loop.
+        if next_id == _TGT_PAD_ID:
+            break
 
-    finished = [
-        beam for beam in beams
-        if beam[2]
-    ]
-
-    if finished:
-        best_beam = max(
-            finished,
-            key=lambda beam: beam[1]
+        # IMPORTANT:
+        # After the first step, decoder_with_past expects ONLY the
+        # newly generated token, not the complete generated prefix.
+        decoder_input_ids = np.array(
+            [[next_id]],
+            dtype=np.int64
         )
-        selection_type = "finished"
-    else:
-        best_beam = max(
-            beams,
-            key=lambda beam: beam[1]
-        )
-        selection_type = "active"
-
-    best_tokens = best_beam[0]
-
-    # Remove decoder start token.
-    output_ids = best_tokens[1:]
-
-    # Remove EOS/PAD if they were retained in the sequence.
-    output_ids = [
-        token_id
-        for token_id in output_ids
-        if token_id not in (
-            _TGT_EOS_ID,
-            _TGT_PAD_ID,
-        )
-    ]
-
-    print(
-        "Selected beam type:",
-        selection_type
-    )
-
-    print(
-        "Selected beam score:",
-        best_beam[1]
-    )
-
-    print(
-        "Selected token count:",
-        len(output_ids)
-    )
-
-    print(
-        "Selected token ids:",
-        output_ids
-    )
 
     return output_ids
 
+
+# ============================================================
+# TARGET DETOKENIZE
+# ============================================================
+
+def _decode_tgt(ids):
+    """Decode target IDs using dict.TGT.json token strings."""
+    pieces = []
+    special_ids = {_TGT_PAD_ID, _TGT_EOS_ID, _TGT_BOS_ID}
+    safe_ids = []
+
+    for raw_id in ids:
+        token_id = int(raw_id)
+        if token_id < 0 or token_id >= _TGT_VOCAB_SIZE:
+            token_id = _TGT_UNK_ID
+        safe_ids.append(token_id)
+        if token_id in special_ids:
+            continue
+        piece = _tgt_id_to_token.get(token_id, _UNK_TOKEN)
+        if piece in SPECIAL_TAGS:
+            continue
+        pieces.append(piece)
+
+    if not pieces:
+        return ""
+
+    text = "".join(pieces).replace("\u2581", " ").strip()
+    text = unicodedata.normalize("NFC", text)
+    text = re.sub(r"\s+([।॥.!?,;:])", r"\1", text)
+
+    print("Target IDs:", safe_ids[:80])
+    print("Target pieces:", pieces[:80])
+    print("Raw target text:", text)
+    return text.strip()
 
 # ============================================================
 # TRANSLATION
@@ -903,31 +1009,83 @@ def translate(hindi_text):
     if not hindi_text:
         return ""
 
+    print("============================================================")
     print("Translating:", hindi_text)
 
     # --------------------------------------------------------
-    # IndicTrans2 tagged input format:
-    # "{src_lang} {tgt_lang} {sentence}"
+    # VERIFIED DICTIONARY FIRST
     # --------------------------------------------------------
 
-    tagged_text = "hin_Deva sat_Olck " + hindi_text
+    dictionary_result = _dictionary_lookup(hindi_text)
 
-    print("Tagged input:", tagged_text)
+    print("Dictionary lookup result:", repr(dictionary_result))
+
+    if dictionary_result:
+        print("Local dictionary hit for:", hindi_text)
+
+        print(
+            "Dictionary match:",
+            hindi_text,
+            "->",
+            dictionary_result
+        )
+
+        return dictionary_result.strip()
+
+    # --------------------------------------------------------
+    # INDIC TRANS2 TAGGED INPUT
+    # --------------------------------------------------------
+
+    tagged_text = (
+        "hin_Deva sat_Olck "
+        + hindi_text
+    )
+
+    print(
+        "Tagged input:",
+        tagged_text
+    )
 
     # --------------------------------------------------------
     # TOKENIZE
     # --------------------------------------------------------
 
-    source_ids = _encode_src(tagged_text)
+    source_ids = _encode_src(
+        tagged_text
+    )
 
-    print("Source token count:", len(source_ids))
-    print("Source ids:", source_ids)
+    print(
+        "Source token count:",
+        len(source_ids)
+    )
+
+    print(
+        "Source IDs:",
+        source_ids
+    )
 
     if not source_ids:
         return ""
 
+    _MODEL_MAX_SOURCE = int(
+        _model_config.get(
+            "max_source_positions",
+            256
+        )
+    )
+
+    if len(source_ids) > _MODEL_MAX_SOURCE:
+
+        raise ValueError(
+            "Input is too long for this IndicTrans2 checkpoint: "
+            + str(len(source_ids))
+            + " tokens; maximum is "
+            + str(_MODEL_MAX_SOURCE)
+            + ". Split the text into shorter sentences."
+        )
+
     # --------------------------------------------------------
-    # INPUT
+    # INPUT TENSORS
     # --------------------------------------------------------
 
     input_ids = np.array(
@@ -944,32 +1102,64 @@ def translate(hindi_text):
     # ENCODER
     # --------------------------------------------------------
 
+    print("Running encoder...")
+
     encoder_hidden_states = _run_encoder(
         input_ids,
         attention_mask
+    )
+
+    print(
+        "Encoder output shape:",
+        encoder_hidden_states.shape
     )
 
     # --------------------------------------------------------
     # DECODER
     # --------------------------------------------------------
 
-    output_ids = _beam_search(
-        encoder_hidden_states=encoder_hidden_states,
-        encoder_attention_mask=attention_mask,
-        beam_size=BEAM_SIZE,
-        max_length=MAX_LENGTH,
-        length_penalty=LENGTH_PENALTY,
+    print(
+        "Running decoder with KV cache..."
     )
 
-    if not output_ids:
+    output_ids = _generate(
+        encoder_hidden_states,
+        attention_mask,
+        max_length=MAX_LENGTH,
+    )
+
+    if len(output_ids) <= 1:
+        print(
+            "WARNING: decoder generated no target tokens."
+        )
         return ""
+
+    # Remove decoder start token.
+    output_ids = output_ids[1:]
+
+    # Remove terminal special tokens.
+    output_ids = [
+        token_id
+        for token_id in output_ids
+        if token_id not in (
+            _TGT_EOS_ID,
+            _TGT_PAD_ID,
+        )
+    ]
 
     # --------------------------------------------------------
     # DETOKENIZE
     # --------------------------------------------------------
 
-    result = _decode_tgt(output_ids)
+    result = _decode_tgt(
+        output_ids
+    )
 
-    print("Translation:", result)
+    print(
+        "Translation:",
+        result
+    )
+
+    print("============================================================")
 
     return result.strip()

@@ -61,6 +61,7 @@ import com.example.translation.ui.theme.TranslationTheme
 class MainActivity : ComponentActivity() {
 
     // =========================================================
+    // =========================================================
     // VOSK OFFLINE HINDI SPEECH RECOGNITION
     // =========================================================
 
@@ -118,7 +119,10 @@ class MainActivity : ComponentActivity() {
         onFinalResult: (String) -> Unit,
         onError: (String) -> Unit
     ) {
-        if (isRecording) return
+        if (isRecording) {
+            Log.d("Vosk", "Recognition already running")
+            return
+        }
 
         val model = voskModel
 
@@ -128,13 +132,16 @@ class MainActivity : ComponentActivity() {
         }
 
         try {
-            voskRecognizer?.close()
+            // Make sure any previous session is completely finished.
+            stopVoskRecognition()
 
-            voskRecognizer =
+            val recognizer =
                 Recognizer(
                     model,
                     sampleRate.toFloat()
                 )
+
+            voskRecognizer = recognizer
 
             val recorder =
                 AudioRecord(
@@ -147,6 +154,8 @@ class MainActivity : ComponentActivity() {
 
             if (recorder.state != AudioRecord.STATE_INITIALIZED) {
                 recorder.release()
+                recognizer.close()
+                voskRecognizer = null
                 onError("Could not initialize the microphone.")
                 return
             }
@@ -156,13 +165,15 @@ class MainActivity : ComponentActivity() {
 
             recorder.startRecording()
 
-            recordingThread = Thread {
-
+            val thread = Thread {
+                // Keep a stable reference for this recording session.
+                // The UI thread cannot replace/close this reference while
+                // the recording thread is inside Vosk.
+                val localRecognizer = recognizer
                 val buffer = ByteArray(4096)
 
                 try {
                     while (isRecording) {
-
                         val bytesRead =
                             recorder.read(
                                 buffer,
@@ -174,17 +185,19 @@ class MainActivity : ComponentActivity() {
                             continue
                         }
 
-                        val recognizer =
-                            voskRecognizer ?: break
+                        // Stop may have been requested while read() was running.
+                        if (!isRecording) {
+                            break
+                        }
 
                         if (
-                            recognizer.acceptWaveForm(
+                            localRecognizer.acceptWaveForm(
                                 buffer,
                                 bytesRead
                             )
                         ) {
                             val resultJson =
-                                recognizer.result
+                                localRecognizer.result
 
                             val text =
                                 extractVoskText(resultJson)
@@ -194,15 +207,12 @@ class MainActivity : ComponentActivity() {
                                     onFinalResult(text)
                                 }
                             }
-
                         } else {
                             val partialJson =
-                                recognizer.partialResult
+                                localRecognizer.partialResult
 
                             val partialText =
-                                extractVoskPartialText(
-                                    partialJson
-                                )
+                                extractVoskPartialText(partialJson)
 
                             if (partialText.isNotBlank()) {
                                 runOnUiThread {
@@ -212,45 +222,52 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    val recognizer =
-                        voskRecognizer
+                    // A normal button press sets isRecording=false.
+                    // In that case, stopVoskRecognition() will wait for this
+                    // thread before closing the recognizer.
+                    if (!isRecording) {
+                        return@Thread
+                    }
 
-                    if (recognizer != null) {
+                    val finalJson =
+                        localRecognizer.finalResult
 
-                        val finalJson =
-                            recognizer.finalResult
+                    val finalText =
+                        extractVoskText(finalJson)
 
-                        val finalText =
-                            extractVoskText(finalJson)
-
-                        if (finalText.isNotBlank()) {
-                            runOnUiThread {
-                                onFinalResult(finalText)
-                            }
+                    if (finalText.isNotBlank()) {
+                        runOnUiThread {
+                            onFinalResult(finalText)
                         }
                     }
 
                 } catch (e: Exception) {
-
                     Log.e(
                         "Vosk",
                         "Recognition failed",
                         e
                     )
 
-                    runOnUiThread {
-                        onError(
-                            e.message
-                                ?: "Speech recognition failed."
-                        )
+                    if (isRecording) {
+                        runOnUiThread {
+                            onError(
+                                e.message
+                                    ?: "Speech recognition failed."
+                            )
+                        }
                     }
+                } finally {
+                    Log.d(
+                        "Vosk",
+                        "Recording thread finished"
+                    )
                 }
             }
 
-            recordingThread?.start()
+            recordingThread = thread
+            thread.start()
 
         } catch (e: Exception) {
-
             Log.e(
                 "Vosk",
                 "Could not start recognition",
@@ -267,24 +284,64 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun stopVoskRecognition() {
+        // 1. Tell the recording thread to stop.
         isRecording = false
 
-        try {
-            audioRecord?.stop()
-        } catch (_: Exception) {
-        }
+        // 2. Stop microphone input so recorder.read() can return.
+        val recorder = audioRecord
 
         try {
-            audioRecord?.release()
-        } catch (_: Exception) {
+            recorder?.stop()
+        } catch (e: Exception) {
+            Log.d(
+                "Vosk",
+                "AudioRecord stop: ${e.message}"
+            )
+        }
+
+        // 3. Wait for the recording thread to finish all native Vosk work.
+        // The recognizer is NOT closed until this thread has finished.
+        val thread = recordingThread
+
+        if (
+            thread != null &&
+            thread != Thread.currentThread()
+        ) {
+            try {
+                thread.join(1000)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+
+                Log.d(
+                    "Vosk",
+                    "Interrupted while waiting for recording thread"
+                )
+            }
+        }
+
+        // 4. Release the microphone.
+        try {
+            recorder?.release()
+        } catch (e: Exception) {
+            Log.d(
+                "Vosk",
+                "AudioRecord release: ${e.message}"
+            )
         }
 
         audioRecord = null
         recordingThread = null
 
+        // 5. Close Vosk only after the recording thread has stopped using it.
+        val recognizer = voskRecognizer
+
         try {
-            voskRecognizer?.close()
-        } catch (_: Exception) {
+            recognizer?.close()
+        } catch (e: Exception) {
+            Log.d(
+                "Vosk",
+                "Recognizer close: ${e.message}"
+            )
         }
 
         voskRecognizer = null
@@ -295,12 +352,14 @@ class MainActivity : ComponentActivity() {
             JSONObject(json)
                 .optString("text", "")
                 .trim()
+
         } catch (e: Exception) {
             Log.e(
                 "Vosk",
                 "Could not parse result: $json",
                 e
             )
+
             ""
         }
     }
@@ -310,29 +369,35 @@ class MainActivity : ComponentActivity() {
             JSONObject(json)
                 .optString("partial", "")
                 .trim()
+
         } catch (e: Exception) {
             Log.e(
                 "Vosk",
                 "Could not parse partial result: $json",
                 e
             )
+
             ""
         }
     }
 
     override fun onDestroy() {
+        // Stop recognition completely before destroying the Vosk model.
         stopVoskRecognition()
 
         try {
             voskModel?.close()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Log.d(
+                "Vosk",
+                "Model close: ${e.message}"
+            )
         }
 
         voskModel = null
 
         super.onDestroy()
     }
-
 
     private fun copyVoskModel(): String {
         val modelDir = File(filesDir, "vosk")
@@ -400,6 +465,8 @@ class MainActivity : ComponentActivity() {
 
                 "Voice Translation" -> VoiceScreen()
 
+                "Materials" -> MaterialsScreen()
+
                 "Worksheets" -> WorksheetScreen()
 
                 "Settings" -> SettingsScreen()
@@ -440,47 +507,215 @@ class MainActivity : ComponentActivity() {
                     expanded = menuExpanded,
                     onDismissRequest = {
                         menuExpanded = false
-                    }
+                    },
+                    modifier = Modifier
+                        .width(235.dp),
+                    shape = RoundedCornerShape(18.dp),
+                    containerColor = Color.White,
+                    tonalElevation = 4.dp,
+                    shadowElevation = 10.dp
                 ) {
+
+                    // Menu heading
+                    DropdownMenuItem(
+                        text = {
+                            Column(
+                                modifier = Modifier.padding(vertical = 2.dp)
+                            ) {
+                                Text(
+                                    text = "Navigate",
+                                    color = Color(0xFF0F766E),
+                                    fontWeight = FontWeight.Bold,
+                                    style = MaterialTheme.typography.titleMedium
+                                )
+                                Text(
+                                    text = "Choose a section",
+                                    color = Color(0xFF6B7280),
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                        },
+                        onClick = { },
+                        enabled = false,
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                            horizontal = 18.dp,
+                            vertical = 8.dp
+                        )
+                    )
 
                     DropdownMenuItem(
                         text = {
-                            Text("Translation")
+                            Text(
+                                "Translation",
+                                color = if (currentPage == "Translation")
+                                    Color(0xFF0F766E)
+                                else Color(0xFF1F2937),
+                                fontWeight = if (currentPage == "Translation")
+                                    FontWeight.Bold
+                                else FontWeight.Normal
+                            )
+                        },
+                        leadingIcon = {
+                            Text(
+                                "Aa",
+                                color = Color(0xFF0F766E),
+                                fontWeight = FontWeight.Bold
+                            )
+                        },
+                        trailingIcon = {
+                            if (currentPage == "Translation") {
+                                Text(
+                                    "✓",
+                                    color = Color(0xFF0F766E),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
                         },
                         onClick = {
                             currentPage = "Translation"
                             menuExpanded = false
-                        }
+                        },
+                        modifier = Modifier.padding(horizontal = 6.dp)
                     )
 
                     DropdownMenuItem(
                         text = {
-                            Text("Voice Translation")
+                            Text(
+                                "Voice Translation",
+                                color = if (currentPage == "Voice Translation")
+                                    Color(0xFF0F766E)
+                                else Color(0xFF1F2937),
+                                fontWeight = if (currentPage == "Voice Translation")
+                                    FontWeight.Bold
+                                else FontWeight.Normal
+                            )
+                        },
+                        leadingIcon = {
+                            Text(
+                                "♫",
+                                color = Color(0xFF0F766E),
+                                fontWeight = FontWeight.Bold
+                            )
+                        },
+                        trailingIcon = {
+                            if (currentPage == "Voice Translation") {
+                                Text(
+                                    "✓",
+                                    color = Color(0xFF0F766E),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
                         },
                         onClick = {
                             currentPage = "Voice Translation"
                             menuExpanded = false
-                        }
+                        },
+                        modifier = Modifier.padding(horizontal = 6.dp)
                     )
 
                     DropdownMenuItem(
                         text = {
-                            Text("Worksheets")
+                            Text(
+                                "Materials",
+                                color = if (currentPage == "Materials")
+                                    Color(0xFF0F766E)
+                                else Color(0xFF1F2937),
+                                fontWeight = if (currentPage == "Materials")
+                                    FontWeight.Bold
+                                else FontWeight.Normal
+                            )
+                        },
+                        leadingIcon = {
+                            Text(
+                                "▤",
+                                color = Color(0xFF0F766E),
+                                fontWeight = FontWeight.Bold
+                            )
+                        },
+                        trailingIcon = {
+                            if (currentPage == "Materials") {
+                                Text(
+                                    "✓",
+                                    color = Color(0xFF0F766E),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        },
+                        onClick = {
+                            currentPage = "Materials"
+                            menuExpanded = false
+                        },
+                        modifier = Modifier.padding(horizontal = 6.dp)
+                    )
+
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                "Worksheets",
+                                color = if (currentPage == "Worksheets")
+                                    Color(0xFF0F766E)
+                                else Color(0xFF1F2937),
+                                fontWeight = if (currentPage == "Worksheets")
+                                    FontWeight.Bold
+                                else FontWeight.Normal
+                            )
+                        },
+                        leadingIcon = {
+                            Text(
+                                "▣",
+                                color = Color(0xFF0F766E),
+                                fontWeight = FontWeight.Bold
+                            )
+                        },
+                        trailingIcon = {
+                            if (currentPage == "Worksheets") {
+                                Text(
+                                    "✓",
+                                    color = Color(0xFF0F766E),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
                         },
                         onClick = {
                             currentPage = "Worksheets"
                             menuExpanded = false
-                        }
+                        },
+                        modifier = Modifier.padding(horizontal = 6.dp)
                     )
 
                     DropdownMenuItem(
                         text = {
-                            Text("Settings")
+                            Text(
+                                "Settings",
+                                color = if (currentPage == "Settings")
+                                    Color(0xFF0F766E)
+                                else Color(0xFF1F2937),
+                                fontWeight = if (currentPage == "Settings")
+                                    FontWeight.Bold
+                                else FontWeight.Normal
+                            )
+                        },
+                        leadingIcon = {
+                            Text(
+                                "⚙",
+                                color = Color(0xFF0F766E),
+                                fontWeight = FontWeight.Bold
+                            )
+                        },
+                        trailingIcon = {
+                            if (currentPage == "Settings") {
+                                Text(
+                                    "✓",
+                                    color = Color(0xFF0F766E),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
                         },
                         onClick = {
                             currentPage = "Settings"
                             menuExpanded = false
-                        }
+                        },
+                        modifier = Modifier.padding(horizontal = 6.dp)
                     )
                 }
             }
@@ -505,6 +740,10 @@ class MainActivity : ComponentActivity() {
 
         var isLoading by remember {
             mutableStateOf(false)
+        }
+
+        var saveMessage by remember {
+            mutableStateOf("")
         }
 
         val teal = Color(0xFF0F766E)
@@ -675,6 +914,7 @@ class MainActivity : ComponentActivity() {
                                     onClick = {
                                         hindiText = ""
                                         santaliText = ""
+                                        saveMessage = ""
                                     }
                                 ) {
 
@@ -693,6 +933,7 @@ class MainActivity : ComponentActivity() {
                             onValueChange = {
                                 hindiText = it
                                 santaliText = ""
+                                saveMessage = ""
                             },
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -700,9 +941,20 @@ class MainActivity : ComponentActivity() {
                             shape = RoundedCornerShape(12.dp),
                             placeholder = {
                                 Text(
-                                    "जैसे: आज हम गिनती सीखेंगे।"
+                                    text = "जैसे: आज हम गिनती सीखेंगे।",
+                                    color = Color(0xFF6B7280)
                                 )
                             },
+                            colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color(0xFF1F2937),
+                                unfocusedTextColor = Color(0xFF1F2937),
+                                disabledTextColor = Color(0xFF6B7280),
+                                focusedPlaceholderColor = Color(0xFF6B7280),
+                                unfocusedPlaceholderColor = Color(0xFF6B7280),
+                                focusedBorderColor = Color(0xFF0F766E),
+                                unfocusedBorderColor = Color(0xFF9CA3AF),
+                                cursorColor = Color(0xFF0F766E)
+                            ),
                             minLines = 4,
                             maxLines = 4
                         )
@@ -754,6 +1006,7 @@ class MainActivity : ComponentActivity() {
 
                         isLoading = true
                         santaliText = ""
+                        saveMessage = ""
 
                         Thread {
 
@@ -853,22 +1106,95 @@ class MainActivity : ComponentActivity() {
                         ) {
 
                             Text(
+                                text = "Hindi",
+                                color = teal,
+                                fontWeight = FontWeight.Bold
+                            )
+
+                            Spacer(modifier = Modifier.height(5.dp))
+
+                            Text(
+                                text = hindiText,
+                                style = MaterialTheme.typography.bodyLarge
+                            )
+
+                            Spacer(modifier = Modifier.height(14.dp))
+
+                            Text(
                                 text = "Santali • ᱚᱞ ᱪᱤᱠᱤ",
                                 color = teal,
                                 fontWeight = FontWeight.Bold
                             )
 
-                            Spacer(modifier = Modifier.height(10.dp))
+                            Spacer(modifier = Modifier.height(5.dp))
 
                             Text(
                                 text = santaliText,
                                 style = MaterialTheme.typography.bodyLarge,
                                 fontWeight = FontWeight.Medium
                             )
+
+                            Spacer(modifier = Modifier.height(15.dp))
+
+                            Button(
+                                onClick = {
+                                    if (hindiText.isBlank() || santaliText.isBlank()) {
+                                        return@Button
+                                    }
+
+                                    saveMessage = "Saving..."
+
+                                    Thread {
+                                        try {
+                                            NlpEngine.saveVocabPair(
+                                                hindiText,
+                                                santaliText
+                                            )
+
+                                            runOnUiThread {
+                                                saveMessage = "✓ Saved to Materials"
+                                            }
+                                        } catch (e: Exception) {
+                                            Log.e(
+                                                "Materials",
+                                                "Failed to save translation",
+                                                e
+                                            )
+
+                                            runOnUiThread {
+                                                saveMessage =
+                                                    "Could not save material"
+                                            }
+                                        }
+                                    }.start()
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(48.dp),
+                                shape = RoundedCornerShape(12.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = teal
+                                )
+                            ) {
+                                Text(
+                                    text = "＋ Save to Materials",
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+
+                            if (saveMessage.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(8.dp))
+
+                                Text(
+                                    text = saveMessage,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    color = teal,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
                         }
                     }
                 }
-
                 Spacer(modifier = Modifier.height(30.dp))
             }
         }
@@ -1363,6 +1689,150 @@ class MainActivity : ComponentActivity() {
 
 
     // =========================================================
+    // MATERIALS PAGE
+    // =========================================================
+
+    @Composable
+    fun MaterialsScreen() {
+
+        val teal = Color(0xFF0F766E)
+
+        var materials by remember {
+            mutableStateOf(
+                NlpEngine.getAllVocabPairs()
+            )
+        }
+
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = Color(0xFFF7FAF9)
+        ) {
+
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(20.dp)
+            ) {
+
+                Spacer(modifier = Modifier.height(35.dp))
+
+                Text(
+                    text = "Saved Materials",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = teal
+                )
+
+                Text(
+                    text = "Hindi + Santali content for learning resources",
+                    color = Color.Gray
+                )
+
+                Spacer(modifier = Modifier.height(25.dp))
+
+                if (materials.isEmpty()) {
+
+                    DemoCard(
+                        title = "No materials saved",
+                        content =
+                            "Translate Hindi content and tap " +
+                                    "\"Save to Materials\" to add it here."
+                    )
+
+                } else {
+
+                    Text(
+                        text = "${materials.size} saved item(s)",
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.DarkGray
+                    )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    materials.forEachIndexed { index, pair ->
+
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(18.dp),
+                            colors = CardDefaults.cardColors(
+                                containerColor = Color.White
+                            )
+                        ) {
+
+                            Column(
+                                modifier = Modifier.padding(16.dp)
+                            ) {
+
+                                Text(
+                                    text = "Material ${index + 1}",
+                                    fontWeight = FontWeight.Bold,
+                                    color = teal
+                                )
+
+                                Spacer(modifier = Modifier.height(10.dp))
+
+                                Text(
+                                    text = "Hindi",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.Gray
+                                )
+
+                                Text(
+                                    text = pair.first,
+                                    style = MaterialTheme.typography.bodyLarge
+                                )
+
+                                Spacer(modifier = Modifier.height(10.dp))
+
+                                Text(
+                                    text = "Santali",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color.Gray
+                                )
+
+                                Text(
+                                    text = pair.second,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+                    }
+
+                    Spacer(modifier = Modifier.height(15.dp))
+
+                    Button(
+                        onClick = {
+                            NlpEngine.clearVocab()
+                            materials = emptyList()
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFFB91C1C)
+                        )
+                    ) {
+                        Text(
+                            text = "Clear All Materials",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(25.dp))
+            }
+        }
+    }
+
+
+    // =========================================================
     // WORKSHEET PAGE
     // =========================================================
 
@@ -1370,6 +1840,18 @@ class MainActivity : ComponentActivity() {
     fun WorksheetScreen() {
 
         val teal = Color(0xFF0F766E)
+
+        var title by remember {
+            mutableStateOf("My Santali Worksheet")
+        }
+
+        var statusText by remember {
+            mutableStateOf("")
+        }
+
+        var isGenerating by remember {
+            mutableStateOf(false)
+        }
 
         Surface(
             modifier = Modifier.fillMaxSize(),
@@ -1399,57 +1881,239 @@ class MainActivity : ComponentActivity() {
 
                 Spacer(modifier = Modifier.height(25.dp))
 
+                // -------------------------------------------------
+                // WORKSHEET TITLE
+                // -------------------------------------------------
+
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = Color.White
+                    )
+                ) {
+
+                    Column(
+                        modifier = Modifier.padding(16.dp)
+                    ) {
+
+                        Text(
+                            text = "Worksheet Title",
+                            fontWeight = FontWeight.Bold
+                        )
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        OutlinedTextField(
+                            value = title,
+                            onValueChange = {
+                                title = it
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            singleLine = true,
+                            placeholder = {
+                                Text("e.g. Numbers 1–10")
+                            }
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(15.dp))
+
+                // -------------------------------------------------
+                // INFORMATION
+                // -------------------------------------------------
 
                 DemoCard(
-                    title = "Create New Worksheet",
-                    content = "Generate Hindi + Santali learning material"
+                    title = "Bilingual Worksheet",
+                    content =
+                        "Your saved Hindi → Santali translations " +
+                                "will be used to create a printable worksheet."
                 )
 
                 Spacer(modifier = Modifier.height(15.dp))
 
+                // -------------------------------------------------
+                // GENERATE BUTTON
+                // -------------------------------------------------
+
                 Button(
-                    onClick = { },
+                    onClick = {
+
+                        if (isGenerating) {
+                            return@Button
+                        }
+
+                        isGenerating = true
+                        statusText = "Generating worksheet..."
+
+                        Thread {
+
+                            try {
+
+                                val pairs =
+                                    NlpEngine.getAllVocabPairs()
+
+                                if (pairs.isEmpty()) {
+
+                                    runOnUiThread {
+                                        statusText =
+                                            "No saved translations yet. Translate some Hindi text first."
+                                        isGenerating = false
+                                    }
+
+                                    return@Thread
+                                }
+
+                                val pdfPath =
+                                    NlpEngine.generateWorksheet(
+                                        title = title,
+                                        pairs = pairs
+                                    )
+
+                                runOnUiThread {
+
+                                    if (pdfPath.isNotBlank()) {
+
+                                        statusText =
+                                            "Worksheet created successfully!"
+
+                                        PdfFiles.openPdf(
+                                            this@MainActivity,
+                                            pdfPath
+                                        )
+
+                                    } else {
+
+                                        statusText =
+                                            "Could not generate worksheet."
+                                    }
+
+                                    isGenerating = false
+                                }
+
+                            } catch (e: Exception) {
+
+                                Log.e(
+                                    "WORKSHEET",
+                                    "Worksheet generation failed",
+                                    e
+                                )
+
+                                runOnUiThread {
+
+                                    statusText =
+                                        "Error: ${e.message}"
+
+                                    isGenerating = false
+                                }
+                            }
+
+                        }.start()
+                    },
+
+                    enabled = !isGenerating,
+
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(52.dp),
+
                     shape = RoundedCornerShape(14.dp),
+
                     colors = ButtonDefaults.buttonColors(
                         containerColor = teal
                     )
                 ) {
 
-                    Text(
-                        text = "＋ Create Worksheet",
-                        fontWeight = FontWeight.Bold
+                    if (isGenerating) {
+
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(21.dp),
+                            color = Color.White,
+                            strokeWidth = 2.dp
+                        )
+
+                        Spacer(
+                            modifier = Modifier.width(8.dp)
+                        )
+
+                        Text("Generating...")
+
+                    } else {
+
+                        Text(
+                            text = "＋ Create Worksheet",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+
+                // -------------------------------------------------
+                // STATUS
+                // -------------------------------------------------
+
+                if (statusText.isNotEmpty()) {
+
+                    Spacer(
+                        modifier = Modifier.height(15.dp)
+                    )
+
+                    DemoCard(
+                        title = "Status",
+                        content = statusText
                     )
                 }
 
-                Spacer(modifier = Modifier.height(25.dp))
+                Spacer(
+                    modifier = Modifier.height(25.dp)
+                )
+
+                // -------------------------------------------------
+                // SAVED VOCABULARY
+                // -------------------------------------------------
 
                 Text(
-                    text = "Recent Resources",
+                    text = "Saved translations",
                     fontWeight = FontWeight.Bold
                 )
 
-                Spacer(modifier = Modifier.height(10.dp))
-
-                DemoCard(
-                    title = "📄 Numbers 1–10",
-                    content = "Hindi + Santali • Beginner"
+                Spacer(
+                    modifier = Modifier.height(10.dp)
                 )
 
-                Spacer(modifier = Modifier.height(10.dp))
+                val pairs =
+                    remember {
+                        mutableStateOf(
+                            NlpEngine.getAllVocabPairs()
+                        )
+                    }
 
-                DemoCard(
-                    title = "📄 Classroom Vocabulary",
-                    content = "Common teacher instructions"
-                )
+                if (pairs.value.isEmpty()) {
 
-                Spacer(modifier = Modifier.height(10.dp))
+                    DemoCard(
+                        title = "No translations saved",
+                        content =
+                            "Translate Hindi text from the Translation " +
+                                    "page to add content here."
+                    )
 
-                DemoCard(
-                    title = "📄 Basic Greetings",
-                    content = "Everyday classroom phrases"
+                } else {
+
+                    pairs.value.forEach { pair ->
+
+                        DemoCard(
+                            title = pair.first,
+                            content = pair.second
+                        )
+
+                        Spacer(
+                            modifier = Modifier.height(8.dp)
+                        )
+                    }
+                }
+
+                Spacer(
+                    modifier = Modifier.height(20.dp)
                 )
             }
         }
