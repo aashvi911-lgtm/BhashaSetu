@@ -19,6 +19,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -469,6 +470,8 @@ class MainActivity : ComponentActivity() {
 
                 "Worksheets" -> WorksheetScreen()
 
+                "Flashcards" -> FlashcardsScreen()
+
                 "Settings" -> SettingsScreen()
             }
 
@@ -678,6 +681,41 @@ class MainActivity : ComponentActivity() {
                         },
                         onClick = {
                             currentPage = "Worksheets"
+                            menuExpanded = false
+                        },
+                        modifier = Modifier.padding(horizontal = 6.dp)
+                    )
+
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                "Flashcards",
+                                color = if (currentPage == "Flashcards")
+                                    Color(0xFF0F766E)
+                                else Color(0xFF1F2937),
+                                fontWeight = if (currentPage == "Flashcards")
+                                    FontWeight.Bold
+                                else FontWeight.Normal
+                            )
+                        },
+                        leadingIcon = {
+                            Text(
+                                "▤",
+                                color = Color(0xFF0F766E),
+                                fontWeight = FontWeight.Bold
+                            )
+                        },
+                        trailingIcon = {
+                            if (currentPage == "Flashcards") {
+                                Text(
+                                    "✓",
+                                    color = Color(0xFF0F766E),
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        },
+                        onClick = {
+                            currentPage = "Flashcards"
                             menuExpanded = false
                         },
                         modifier = Modifier.padding(horizontal = 6.dp)
@@ -1255,6 +1293,10 @@ class MainActivity : ComponentActivity() {
             mutableStateOf(false)
         }
 
+        var isTranslating by remember {
+            mutableStateOf(false)
+        }
+
         var isModelLoading by remember {
             mutableStateOf(true)
         }
@@ -1266,6 +1308,10 @@ class MainActivity : ComponentActivity() {
         }
 
         var errorText by remember {
+            mutableStateOf("")
+        }
+
+        var saveMessage by remember {
             mutableStateOf("")
         }
 
@@ -1572,9 +1618,15 @@ class MainActivity : ComponentActivity() {
                             val textToTranslate =
                                 recognizedHindi.trim()
 
-                            if (textToTranslate.isBlank()) {
+                            if (textToTranslate.isBlank() || isTranslating) {
                                 return@Button
                             }
+
+                            isTranslating = true
+                            santaliText = ""
+                            saveMessage = ""
+                            statusText = "Translating..."
+                            errorText = ""
 
                             Thread {
 
@@ -1588,6 +1640,8 @@ class MainActivity : ComponentActivity() {
 
                                     runOnUiThread {
                                         santaliText = result
+                                        isTranslating = false
+                                        statusText = "Translation complete"
                                     }
 
                                 } catch (e: Exception) {
@@ -1599,9 +1653,10 @@ class MainActivity : ComponentActivity() {
                                     )
 
                                     runOnUiThread {
-
                                         santaliText =
-                                            "Translation failed: ${e.message}"
+                                            "Translation failed: ${e.message ?: "Unknown error"}"
+                                        isTranslating = false
+                                        statusText = "Translation failed"
                                     }
                                 }
 
@@ -1609,7 +1664,8 @@ class MainActivity : ComponentActivity() {
                         },
                         enabled =
                             recognizedHindi.isNotBlank() &&
-                                    !isListening,
+                                    !isListening &&
+                                    !isTranslating,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(52.dp),
@@ -1620,10 +1676,27 @@ class MainActivity : ComponentActivity() {
                             )
                     ) {
 
-                        Text(
-                            text = "Translate to Santali →",
-                            fontWeight = FontWeight.Bold
-                        )
+                        if (isTranslating) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(21.dp),
+                                color = Color.White,
+                                strokeWidth = 2.dp
+                            )
+
+                            Spacer(
+                                modifier = Modifier.width(8.dp)
+                            )
+
+                            Text(
+                                text = "Translating...",
+                                fontWeight = FontWeight.Bold
+                            )
+                        } else {
+                            Text(
+                                text = "Translate to Santali →",
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
 
                     Spacer(
@@ -1636,6 +1709,78 @@ class MainActivity : ComponentActivity() {
                             title = "Santali Output",
                             content = santaliText
                         )
+
+                        Spacer(
+                            modifier = Modifier.height(12.dp)
+                        )
+
+                        Button(
+                            onClick = {
+
+                                if (
+                                    recognizedHindi.isBlank() ||
+                                    santaliText.isBlank() ||
+                                    santaliText.startsWith("Translation failed")
+                                ) {
+                                    return@Button
+                                }
+
+                                saveMessage = "Saving..."
+
+                                Thread {
+                                    try {
+
+                                        NlpEngine.saveVocabPair(
+                                            recognizedHindi,
+                                            santaliText
+                                        )
+
+                                        runOnUiThread {
+                                            saveMessage = "✓ Saved to Materials"
+                                        }
+
+                                    } catch (e: Exception) {
+
+                                        Log.e(
+                                            "Materials",
+                                            "Failed to save voice translation",
+                                            e
+                                        )
+
+                                        runOnUiThread {
+                                            saveMessage =
+                                                "Could not save material"
+                                        }
+                                    }
+                                }.start()
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(48.dp),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = teal
+                            )
+                        ) {
+                            Text(
+                                text = "＋ Save to Materials",
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+
+                        if (saveMessage.isNotEmpty()) {
+
+                            Spacer(
+                                modifier = Modifier.height(8.dp)
+                            )
+
+                            Text(
+                                text = saveMessage,
+                                modifier = Modifier.align(Alignment.CenterHorizontally),
+                                color = teal,
+                                fontWeight = FontWeight.Medium
+                            )
+                        }
                     }
                 }
 
@@ -2115,6 +2260,368 @@ class MainActivity : ComponentActivity() {
                 Spacer(
                     modifier = Modifier.height(20.dp)
                 )
+            }
+        }
+    }
+
+
+    // =========================================================
+    // FLASHCARDS PAGE
+    // =========================================================
+
+    @Composable
+    fun FlashcardsScreen() {
+
+        val teal = Color(0xFF0F766E)
+        val background = Color(0xFFF7FAF9)
+
+        val pairs = remember {
+            NlpEngine.getAllVocabPairs()
+        }
+
+        var currentIndex by remember {
+            mutableStateOf(0)
+        }
+
+        var showAnswer by remember {
+            mutableStateOf(false)
+        }
+
+        var isGenerating by remember {
+            mutableStateOf(false)
+        }
+
+        var statusText by remember {
+            mutableStateOf("")
+        }
+
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = background
+        ) {
+
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+
+                Spacer(modifier = Modifier.height(35.dp))
+
+                Text(
+                    text = "Santali Flashcards",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = teal
+                )
+
+                Text(
+                    text = "Learn Hindi words with their Santali equivalents",
+                    color = Color.Gray
+                )
+
+                Spacer(modifier = Modifier.height(25.dp))
+
+                if (pairs.isEmpty()) {
+
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(18.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = Color.White
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            Text(
+                                text = "No flashcards yet",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF1F2937)
+                            )
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            Text(
+                                text = "Translate and save some Hindi → Santali words first.",
+                                color = Color.Gray
+                            )
+                        }
+                    }
+
+                } else {
+
+                    Text(
+                        text = "Card ${currentIndex + 1} of ${pairs.size}",
+                        color = Color.Gray,
+                        fontWeight = FontWeight.Medium
+                    )
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(300.dp)
+                            .clickable {
+                                showAnswer = !showAnswer
+                            },
+                        shape = RoundedCornerShape(24.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = Color.White
+                        ),
+                        elevation = CardDefaults.cardElevation(4.dp)
+                    ) {
+
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.Center
+                        ) {
+
+                            Text(
+                                text = "HINDI",
+                                color = teal,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+
+                            Spacer(modifier = Modifier.height(16.dp))
+
+                            Text(
+                                text = pairs[currentIndex].first,
+                                style = MaterialTheme.typography.headlineMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF1F2937)
+                            )
+
+                            Spacer(modifier = Modifier.height(22.dp))
+
+                            Surface(
+                                modifier = Modifier.fillMaxWidth(),
+                                color = Color(0xFFE6F4F2),
+                                shape = RoundedCornerShape(14.dp)
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(18.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+
+                                    if (showAnswer) {
+                                        Text(
+                                            text = "SANTALI • ᱚᱞ ᱪᱤᱠᱤ",
+                                            color = teal,
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.Bold
+                                        )
+
+                                        Spacer(modifier = Modifier.height(8.dp))
+
+                                        Text(
+                                            text = pairs[currentIndex].second,
+                                            style = MaterialTheme.typography.headlineMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            color = Color(0xFF1F2937)
+                                        )
+                                    } else {
+                                        Text(
+                                            text = "Tap the card to reveal",
+                                            color = teal,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(18.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+
+                        Button(
+                            onClick = {
+                                currentIndex =
+                                    if (currentIndex == 0) pairs.lastIndex
+                                    else currentIndex - 1
+                                showAnswer = false
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(50.dp),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFFE2E8F0),
+                                contentColor = Color(0xFF1F2937)
+                            )
+                        ) {
+                            Text("← Previous")
+                        }
+
+                        Button(
+                            onClick = {
+                                showAnswer = !showAnswer
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(50.dp),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = teal
+                            )
+                        ) {
+                            Text(
+                                if (showAnswer) "Hide Answer" else "Reveal Answer",
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+
+                        Button(
+                            onClick = {
+                                currentIndex =
+                                    (currentIndex + 1) % pairs.size
+                                showAnswer = false
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(50.dp),
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFFE2E8F0),
+                                contentColor = Color(0xFF1F2937)
+                            )
+                        ) {
+                            Text("Next →")
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(22.dp))
+
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(18.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = Color.White
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp)
+                        ) {
+                            Text(
+                                text = "Printable Flashcards",
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF1F2937)
+                            )
+
+                            Spacer(modifier = Modifier.height(6.dp))
+
+                            Text(
+                                text = "Create a printable PDF from your saved vocabulary.",
+                                color = Color.Gray,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            Button(
+                                onClick = {
+                                    if (isGenerating) return@Button
+
+                                    isGenerating = true
+                                    statusText = "Generating flashcards..."
+
+                                    Thread {
+                                        try {
+                                            val pdfPath =
+                                                NlpEngine.generateFlashcards(pairs)
+
+                                            runOnUiThread {
+                                                isGenerating = false
+
+                                                if (pdfPath.isNotBlank()) {
+                                                    statusText =
+                                                        "Flashcards created successfully!"
+
+                                                    PdfFiles.openPdf(
+                                                        this@MainActivity,
+                                                        pdfPath
+                                                    )
+                                                } else {
+                                                    statusText =
+                                                        "Could not generate flashcards."
+                                                }
+                                            }
+
+                                        } catch (e: Exception) {
+                                            Log.e(
+                                                "FLASHCARD_GEN",
+                                                "Failed to generate flashcards",
+                                                e
+                                            )
+
+                                            runOnUiThread {
+                                                isGenerating = false
+                                                statusText =
+                                                    "Flashcard generation failed: ${e.message}"
+                                            }
+                                        }
+                                    }.start()
+                                },
+                                enabled = !isGenerating,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(52.dp),
+                                shape = RoundedCornerShape(14.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = teal
+                                )
+                            ) {
+
+                                if (isGenerating) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(21.dp),
+                                        color = Color.White,
+                                        strokeWidth = 2.dp
+                                    )
+
+                                    Spacer(modifier = Modifier.width(8.dp))
+
+                                    Text("Generating...")
+
+                                } else {
+                                    Text(
+                                        text = "＋ Create Printable Flashcards",
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    if (statusText.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        DemoCard(
+                            title = "Status",
+                            content = statusText
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(25.dp))
             }
         }
     }

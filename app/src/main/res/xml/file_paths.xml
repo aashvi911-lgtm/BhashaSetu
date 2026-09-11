@@ -5,4 +5,8 @@
         name="worksheets"
         path="worksheets/" />
 
+    <files-path
+        name="flashcards"
+        path="flashcards/" />
+
 </paths>
